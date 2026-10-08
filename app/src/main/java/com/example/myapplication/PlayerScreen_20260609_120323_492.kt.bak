@@ -1,0 +1,682 @@
+package com.example.myapplication
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.util.Log
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+private val PlayerBg = Color(0xFF1A2332)
+private val PlayerBgDark = Color(0xFF0D1520)
+private val PlayerBlue = Color(0xFF4A90D9)
+private val PlayerLightBlue = Color(0xFF67B8F7)
+private val PlayerTextSecondary = Color(0xFF9A9AB0)
+private val PlayerCard = Color(0xFF1E2D3D)
+
+private fun formatDuration(ms: Long): String {
+    val total = ms / 1000
+    val min = total / 60
+    val sec = total % 60
+    return "%d:%02d".format(min, sec)
+}
+
+@Composable
+fun PlayerScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+
+    // ── 服务状态 ──
+    var service by remember { mutableStateOf<MusicPlaybackService?>(null) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var currentIndex by remember { mutableStateOf(-1) }
+    var currentPosition by remember { mutableLongStateOf(0L) }
+    var duration by remember { mutableLongStateOf(0L) }
+    var playlist by remember { mutableStateOf<List<MusicFileInfo>>(emptyList()) }
+
+    var isSeeking by remember { mutableStateOf(false) }
+    var seekPosition by remember { mutableLongStateOf(0L) }
+
+    var loopMode by remember { mutableStateOf(0) }
+
+    // ── 歌词状态 ──
+    var lyricLines by remember { mutableStateOf<List<LyricsManager.LyricLine>>(emptyList()) }
+    var currentLyricIndex by remember { mutableStateOf(-1) }
+    var isSearchingLyrics by remember { mutableStateOf(false) }
+    var matchedSong by remember { mutableStateOf<LyricsManager.SongResult?>(null) }
+    var hasSearchedLyrics by remember { mutableStateOf(false) }
+    var lyricsError by remember { mutableStateOf<String?>(null) }
+    var currentSongKey by remember { mutableStateOf("") }
+    var manualSearchText by remember { mutableStateOf("") }
+    var manualArtistText by remember { mutableStateOf("") }
+    var lyricOffsetSec by remember { mutableFloatStateOf(0f) }
+
+    val handler = remember { Handler(Looper.getMainLooper()) }
+    val lyricListState = rememberLazyListState()
+
+    // ── 歌词偏移持久化 ──
+    val prefs = remember { context.getSharedPreferences("lyrics_offset", Context.MODE_PRIVATE) }
+
+    // ── 绑定服务 ──
+    DisposableEffect(Unit) {
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                val svc = (binder as MusicPlaybackService.LocalBinder).getService()
+                service = svc
+                playlist = svc.getPlaylist()
+                svc.setStateListener(object : MusicPlaybackService.PlaybackStateListener {
+                    override fun onStateChanged(p: Boolean, pos: Long, dur: Long, idx: Int) {
+                        isPlaying = p
+                        if (!isSeeking) currentPosition = pos
+                        duration = dur
+                        currentIndex = idx
+                    }
+                })
+                currentIndex = svc.getCurrentIndex()
+                isPlaying = svc.isPlaying()
+                currentPosition = svc.getCurrentPosition()
+                duration = svc.getDuration()
+            }
+            override fun onServiceDisconnected(name: ComponentName?) {
+                service = null
+            }
+        }
+        val intent = Intent(context, MusicPlaybackService::class.java)
+        context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        onDispose { context.unbindService(connection) }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { handler.removeCallbacksAndMessages(null) }
+    }
+
+    // ── 清空旧缓存（修复前缓存键不含 artist，导致错误匹配） ──
+    LaunchedEffect(Unit) {
+        LyricsManager.clearCache(context)
+    }
+
+    // ── 当前播放文件 ──
+    val currentFile = if (currentIndex in playlist.indices) playlist[currentIndex] else null
+
+    // ── 歌曲变化时读取偏移 + 自动搜索歌词 ──
+    LaunchedEffect(currentFile) {
+        val file = currentFile ?: return@LaunchedEffect
+        // 读取该歌曲保存的歌词偏移
+        lyricOffsetSec = prefs.getFloat("lyric_offset_${file.name}", 0f)
+
+        val keyword = LyricsManager.extractKeyword(file.name)
+        val artist = file.artist
+        Log.d("Lyrics", "自动搜索歌词 — title=\"$keyword\" artist=\"$artist\"")
+        val cacheKey = if (artist.isNotEmpty()) "${artist}|${keyword}" else keyword
+        if (cacheKey == currentSongKey && lyricLines.isNotEmpty()) return@LaunchedEffect
+        currentSongKey = cacheKey
+
+        // 先查缓存
+        val cached = LyricsManager.getCachedLrc(context, cacheKey)
+        if (cached != null) {
+            lyricLines = LyricsManager.parseLrc(cached)
+            hasSearchedLyrics = true
+            matchedSong = null
+            lyricsError = null
+            return@LaunchedEffect
+        }
+
+        // 自动网络搜索
+        lyricLines = emptyList()
+        currentLyricIndex = -1
+        hasSearchedLyrics = false
+        matchedSong = null
+        lyricsError = null
+        isSearchingLyrics = true
+
+        LyricsManager.searchLyrics(keyword, artist) { result, lrc, error ->
+            isSearchingLyrics = false
+            hasSearchedLyrics = true
+            if (lrc != null) {
+                LyricsManager.cacheLrc(context, cacheKey, lrc)
+                lyricLines = LyricsManager.parseLrc(lrc)
+                matchedSong = result
+                lyricsError = null
+            } else {
+                matchedSong = null
+                lyricsError = error
+            }
+        }
+    }
+
+    // ── 歌词当前行计算 + 自动滚动（含偏移） ──
+    LaunchedEffect(currentPosition, lyricLines, lyricOffsetSec) {
+        if (lyricLines.isEmpty()) return@LaunchedEffect
+        val effectivePos = currentPosition + (lyricOffsetSec * 1000).toLong()
+        val idx = lyricLines.indexOfLast { it.timeMs <= effectivePos }
+        if (idx != currentLyricIndex && idx >= 0) {
+            currentLyricIndex = idx
+            lyricListState.scrollToItem(
+                index = (idx - 2).coerceAtLeast(0)
+            )
+        }
+    }
+
+    // ── 动画 ──
+    val pulseInfinite = rememberInfiniteTransition(label = "pulse")
+    val pulseScale by pulseInfinite.animateFloat(
+        initialValue = 1f, targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
+        label = "pulse"
+    )
+
+    val btnInteraction = remember { MutableInteractionSource() }
+    val btnPressed by btnInteraction.collectIsPressedAsState()
+    val btnScale by animateFloatAsState(
+        targetValue = if (btnPressed) 0.88f else 1f,
+        animationSpec = spring(dampingRatio = 0.45f, stiffness = 380f),
+        label = "btn"
+    )
+
+    val displayPosition = if (isSeeking) seekPosition else currentPosition
+    val progress = if (duration > 0) (displayPosition.toFloat() / duration).coerceIn(0f, 1f) else 0f
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(PlayerBg, PlayerBgDark),
+                    startY = 0f, endY = Float.POSITIVE_INFINITY
+                )
+            )
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+
+            // ═══════════════════════════════════════════════
+            // 顶部栏
+            // ═══════════════════════════════════════════════
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "\u2190", fontSize = 24.sp, color = Color.White,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { onBack() }
+                        .padding(8.dp)
+                )
+                Spacer(Modifier.width(12.dp))
+                Column {
+                    Text(
+                        "正在播放", fontSize = 12.sp, color = PlayerTextSecondary,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        currentFile?.name ?: "未知歌曲",
+                        fontSize = 16.sp, color = Color.White,
+                        fontWeight = FontWeight.Bold, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // ═══════════════════════════════════════════════
+            // 歌词区域（直接显示，不再需要封面翻转切换）
+            // ═══════════════════════════════════════════════
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clipToBounds(),
+                contentAlignment = Alignment.Center
+            ) {
+                if (isSearchingLyrics) {
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(32.dp),
+                            strokeWidth = 2.dp,
+                            color = PlayerBlue
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Text("正在搜索歌词...", color = PlayerTextSecondary, fontSize = 14.sp)
+                    }
+                } else if (lyricLines.isNotEmpty()) {
+                    LazyColumn(
+                        state = lyricListState,
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        item { Spacer(Modifier.height(120.dp)) }
+
+                        itemsIndexed(lyricLines) { index, line ->
+                            val isActive = index == currentLyricIndex
+                            Text(
+                                text = line.text,
+                                fontSize = if (isActive) 24.sp else 16.sp,
+                                color = if (isActive) Color.White
+                                        else PlayerTextSecondary.copy(alpha = 0.35f),
+                                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 40.dp, vertical = 10.dp)
+                                    .clickable {
+                                        val seekPos = (line.timeMs - (lyricOffsetSec * 1000).toLong()).coerceAtLeast(0)
+                                        service?.seekTo(seekPos)
+                                        currentLyricIndex = index
+                                        lyricListState.scrollToItem((index - 2).coerceAtLeast(0))
+                                    }
+                            )
+                        }
+
+                        item { Spacer(Modifier.height(120.dp)) }
+                    }
+
+                    // 顶部渐变遮罩
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(80.dp)
+                            .align(Alignment.TopCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(PlayerBgDark, Color.Transparent)
+                                )
+                            )
+                    )
+                    // 底部渐变遮罩
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(80.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(Color.Transparent, PlayerBgDark)
+                                )
+                            )
+                    )
+                } else if (!isSearchingLyrics) {
+                    Column(
+                        modifier = Modifier.fillMaxSize().padding(horizontal = 28.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            lyricsError ?: "暂无歌词",
+                            color = PlayerTextSecondary,
+                            fontSize = 14.sp
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+
+                        // 手动搜索：歌名 + 歌手
+                        OutlinedTextField(
+                            value = manualSearchText,
+                            onValueChange = { manualSearchText = it },
+                            modifier = Modifier.fillMaxWidth(0.8f),
+                            singleLine = true,
+                            placeholder = {
+                                Text("输入歌名搜索...", color = PlayerTextSecondary, fontSize = 13.sp)
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedContainerColor = PlayerCard.copy(alpha = 0.5f),
+                                unfocusedContainerColor = PlayerCard.copy(alpha = 0.5f),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = PlayerBlue,
+                                unfocusedBorderColor = PlayerBlue.copy(alpha = 0.3f),
+                                cursorColor = PlayerBlue
+                            ),
+                            shape = RoundedCornerShape(20.dp),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                            keyboardActions = KeyboardActions(
+                                onNext = { /* focus moves to artist field */ }
+                            )
+                        )
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(0.8f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = manualArtistText,
+                                onValueChange = { manualArtistText = it },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                placeholder = {
+                                    Text("歌手（可选）", color = PlayerTextSecondary, fontSize = 12.sp)
+                                },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedContainerColor = PlayerCard.copy(alpha = 0.5f),
+                                    unfocusedContainerColor = PlayerCard.copy(alpha = 0.5f),
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White,
+                                    focusedBorderColor = PlayerBlue,
+                                    unfocusedBorderColor = PlayerBlue.copy(alpha = 0.3f),
+                                    cursorColor = PlayerBlue
+                                ),
+                                shape = RoundedCornerShape(20.dp),
+                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                                keyboardActions = KeyboardActions(
+                                    onSearch = {
+                                        val kw = manualSearchText.trim()
+                                        val ar = manualArtistText.trim()
+                                        if (kw.isNotEmpty() && !isSearchingLyrics) {
+                                            isSearchingLyrics = true
+                                            lyricsError = null
+                                            Log.d("Lyrics", "手动搜索歌词 — title=\"$kw\" artist=\"$ar\"")
+                                            LyricsManager.searchLyrics(kw, ar) { result, lrc, err ->
+                                                isSearchingLyrics = false
+                                                hasSearchedLyrics = true
+                                                if (lrc != null) {
+                                                    val cacheKey = if (ar.isNotEmpty()) "$ar|$kw" else kw
+                                                    LyricsManager.cacheLrc(context, cacheKey, lrc)
+                                                    lyricLines = LyricsManager.parseLrc(lrc)
+                                                    matchedSong = result
+                                                    lyricsError = null
+                                                } else {
+                                                    matchedSong = null
+                                                    lyricsError = err
+                                                }
+                                            }
+                                        }
+                                    }
+                                )
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "\uD83D\uDD0D",
+                                fontSize = 20.sp,
+                                color = PlayerBlue,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .clickable {
+                                        val kw = manualSearchText.trim()
+                                        val ar = manualArtistText.trim()
+                                        if (kw.isNotEmpty() && !isSearchingLyrics) {
+                                            isSearchingLyrics = true
+                                            lyricsError = null
+                                            Log.d("Lyrics", "手动搜索歌词 — title=\"$kw\" artist=\"$ar\"")
+                                            LyricsManager.searchLyrics(kw, ar) { result, lrc, err ->
+                                                isSearchingLyrics = false
+                                                hasSearchedLyrics = true
+                                                if (lrc != null) {
+                                                    val cacheKey = if (ar.isNotEmpty()) "$ar|$kw" else kw
+                                                    LyricsManager.cacheLrc(context, cacheKey, lrc)
+                                                    lyricLines = LyricsManager.parseLrc(lrc)
+                                                    matchedSong = result
+                                                    lyricsError = null
+                                                } else {
+                                                    matchedSong = null
+                                                    lyricsError = err
+                                                }
+                                            }
+                                        }
+                                    }
+                                    .padding(8.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // 歌词偏移控件（有歌词时显示）
+            // ═══════════════════════════════════════════════
+            if (lyricLines.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        "\u25C0 0.5s",
+                        color = PlayerBlue.copy(alpha = 0.8f),
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                lyricOffsetSec = (lyricOffsetSec - 0.5f).coerceIn(-10f, 10f)
+                                currentFile?.let { f ->
+                                    prefs.edit().putFloat("lyric_offset_${f.name}", lyricOffsetSec).apply()
+                                }
+                            }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                    Text(
+                        if (lyricOffsetSec >= 0) "+${String.format("%.1f", lyricOffsetSec)}s"
+                        else "${String.format("%.1f", lyricOffsetSec)}s",
+                        color = PlayerTextSecondary,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    )
+                    Text(
+                        "0.5s \u25B6",
+                        color = PlayerBlue.copy(alpha = 0.8f),
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                lyricOffsetSec = (lyricOffsetSec + 0.5f).coerceIn(-10f, 10f)
+                                currentFile?.let { f ->
+                                    prefs.edit().putFloat("lyric_offset_${f.name}", lyricOffsetSec).apply()
+                                }
+                            }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            // ═══════════════════════════════════════════════
+            // 进度条
+            // ═══════════════════════════════════════════════
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 32.dp)
+            ) {
+                Slider(
+                    value = progress,
+                    onValueChange = { fraction ->
+                        isSeeking = true
+                        seekPosition = (fraction * duration).toLong()
+                    },
+                    onValueChangeFinished = {
+                        service?.seekTo(seekPosition)
+                        currentPosition = seekPosition
+                        isSeeking = false
+                    },
+                    modifier = Modifier.fillMaxWidth().height(40.dp),
+                    colors = SliderDefaults.colors(
+                        thumbColor = PlayerBlue,
+                        activeTrackColor = PlayerBlue,
+                        inactiveTrackColor = PlayerBlue.copy(alpha = 0.15f)
+                    )
+                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(formatDuration(displayPosition), color = PlayerTextSecondary, fontSize = 12.sp)
+                    Text(formatDuration(duration), color = PlayerTextSecondary, fontSize = 12.sp)
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // ═══════════════════════════════════════════════
+            // 播放控制（四按钮：上一首 / 播放暂停 / 下一首 / 循环模式）
+            // ═══════════════════════════════════════════════
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 28.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clip(CircleShape)
+                        .background(PlayerBlue.copy(alpha = 0.1f))
+                        .clickable(enabled = currentIndex > 0) { service?.playPrev() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "\u23EE", fontSize = 26.sp,
+                        color = if (currentIndex > 0) Color.White else PlayerTextSecondary
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(76.dp)
+                        .scale(btnScale)
+                        .then(if (isPlaying) Modifier.scale(pulseScale) else Modifier)
+                        .clip(CircleShape)
+                        .background(PlayerBlue)
+                        .clickable(
+                            interactionSource = btnInteraction,
+                            indication = null
+                        ) { service?.togglePlayPause() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        if (isPlaying) "\u23F8" else "\u25B6",
+                        fontSize = 32.sp, color = Color.White
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clip(CircleShape)
+                        .background(PlayerBlue.copy(alpha = 0.1f))
+                        .clickable(enabled = currentIndex < playlist.size - 1) { service?.playNext() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "\u23ED", fontSize = 26.sp,
+                        color = if (currentIndex < playlist.size - 1) Color.White else PlayerTextSecondary
+                    )
+                }
+
+                // 循环模式按钮
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(PlayerCard.copy(alpha = 0.6f))
+                        .clickable { loopMode = if (loopMode == 0) 1 else 0 }
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (loopMode == 1) "\uD83D\uDD02" else "\uD83D\uDD01",
+                            fontSize = 14.sp
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (loopMode == 1) "单曲循环" else "列表循环",
+                            fontSize = 12.sp, color = PlayerTextSecondary,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // ═══════════════════════════════════════════════
+            // 歌曲信息（最底部）
+            // ═══════════════════════════════════════════════
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 32.dp)
+                    .padding(bottom = 32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    currentFile?.name ?: "—",
+                    fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                    color = Color.White, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (currentFile != null) "${formatDuration(currentFile.durationMs)} \u00B7 ${currentFile.name.substringAfterLast('.')}" else "—",
+                    fontSize = 13.sp, color = PlayerTextSecondary
+                )
+            }
+        }
+    }
+}
